@@ -4,6 +4,7 @@ These cover the dispatch table (list/schema/refresh/resume vs. model alias) and
 each major run path with httpx mocked at the boundary.
 """
 
+import base64
 from pathlib import Path
 
 import httpx
@@ -413,6 +414,282 @@ def test_refresh_network_failure(runner, monkeypatch):
     r = runner.invoke(cli_app, ["generate", "refresh"])
     assert r.exit_code == 1
     assert "Failed to fetch" in r.stdout
+
+
+# ─── upload subcommand ──────────────────────────────────────────────────
+
+
+def test_upload_missing_arg(runner, api_key):
+    r = runner.invoke(cli_app, ["generate", "upload"])
+    assert r.exit_code == 1
+    assert "Usage" in r.stdout
+
+
+def test_upload_local_file(runner, api_key, tmp_path, monkeypatch):
+    img = tmp_path / "x.png"
+    img.write_bytes(b"png-data")
+    monkeypatch.setattr(
+        "comfy_cli.command.generate.upload.upload_target",
+        lambda target, api_key: gen_app.upload.UploadResult(
+            url="https://cdn/x.png", expires_at="2099-01-01T00:00:00Z", existing_file=False
+        ),
+    )
+    r = runner.invoke(cli_app, ["generate", "upload", str(img)])
+    assert r.exit_code == 0, r.stdout
+    assert "Uploaded" in r.stdout
+    assert "https://cdn/x.png" in r.stdout
+
+
+def test_upload_json_output(runner, api_key, tmp_path, monkeypatch):
+    img = tmp_path / "x.png"
+    img.write_bytes(b"png-data")
+    monkeypatch.setattr(
+        "comfy_cli.command.generate.upload.upload_target",
+        lambda target, api_key: gen_app.upload.UploadResult(
+            url="https://cdn/x.png", expires_at="2099-01-01T00:00:00Z", existing_file=True
+        ),
+    )
+    r = runner.invoke(cli_app, ["generate", "upload", str(img), "--json"])
+    assert r.exit_code == 0
+    flat = "".join(r.stdout.split())
+    assert '"url":"https://cdn/x.png"' in flat
+    assert '"existing_file":true' in flat
+
+
+def test_upload_does_not_mistake_meta_value_for_target(runner, monkeypatch, tmp_path):
+    """`upload --api-key KEY ./img.png` must resolve ./img.png as the target,
+    not KEY — regression check for the positional parsing bug."""
+    img = tmp_path / "x.png"
+    img.write_bytes(b"png-data")
+    captured = {}
+
+    def fake_upload(target, api_key):
+        captured["target"] = target
+        captured["api_key"] = api_key
+        return gen_app.upload.UploadResult(url="https://cdn/x.png", expires_at=None, existing_file=False)
+
+    monkeypatch.setattr("comfy_cli.command.generate.upload.upload_target", fake_upload)
+    r = runner.invoke(cli_app, ["generate", "upload", "--api-key", "comfyui-test", str(img)])
+    assert r.exit_code == 0, r.stdout
+    assert captured["target"] == str(img)
+    assert captured["api_key"] == "comfyui-test"
+
+
+def test_upload_propagates_api_error(runner, api_key, tmp_path, monkeypatch):
+    img = tmp_path / "x.png"
+    img.write_bytes(b"png-data")
+
+    def boom(*a, **kw):
+        raise gen_app.client.ApiError(500, "fail", "boom")
+
+    monkeypatch.setattr("comfy_cli.command.generate.upload.upload_target", boom)
+    r = runner.invoke(cli_app, ["generate", "upload", str(img)])
+    assert r.exit_code == 1
+    assert "Upload failed" in r.stdout
+
+
+# ─── auto-upload during generate ────────────────────────────────────────
+
+
+def test_generate_auto_base64_for_kontext(runner, api_key, tmp_path, monkeypatch):
+    """flux-kontext's input_image expects a Base64 string — local files should
+    be auto-encoded with no extra steps."""
+    img = tmp_path / "ref.png"
+    img.write_bytes(b"\x89PNGfake")
+
+    captured = {}
+
+    def fake_post(url, *, json=None, headers=None, timeout=None, **_):
+        captured["body"] = json
+        return httpx.Response(200, json={"id": "job-xyz", "polling_url": "https://x/poll"})
+
+    monkeypatch.setattr(gen_app.client.httpx, "post", fake_post)
+    r = runner.invoke(
+        cli_app,
+        ["generate", "flux-kontext", "--prompt", "edit it", "--input_image", str(img), "--async"],
+    )
+    assert r.exit_code == 0, r.stdout
+    assert captured["body"]["input_image"] == base64.b64encode(b"\x89PNGfake").decode("ascii")
+
+
+def test_generate_auto_upload_leaves_url_alone(runner, api_key, monkeypatch):
+    """A pre-existing https:// URL must NOT trigger an upload."""
+    upload_called = {"hit": False}
+
+    def fake_upload(*a, **kw):
+        upload_called["hit"] = True
+        return gen_app.upload.UploadResult(url="x", expires_at=None, existing_file=False)
+
+    monkeypatch.setattr("comfy_cli.command.generate.upload.upload_path", fake_upload)
+    captured = {}
+
+    def fake_post(url, *, json=None, headers=None, timeout=None, **_):
+        captured["body"] = json
+        return httpx.Response(200, json={"id": "x", "polling_url": "https://x"})
+
+    monkeypatch.setattr(gen_app.client.httpx, "post", fake_post)
+    r = runner.invoke(
+        cli_app,
+        [
+            "generate",
+            "flux-kontext",
+            "--prompt",
+            "x",
+            "--input_image",
+            "https://existing/url.png",
+            "--async",
+        ],
+    )
+    assert r.exit_code == 0
+    assert upload_called["hit"] is False
+    assert captured["body"]["input_image"] == "https://existing/url.png"
+
+
+def test_generate_auto_upload_skipped_for_multipart(runner, api_key, tmp_path, monkeypatch):
+    """Multipart endpoints (ideogram-edit) already stream files via httpx —
+    they must not be funneled through /customers/storage."""
+    img = tmp_path / "x.png"
+    img.write_bytes(b"png")
+
+    upload_called = {"hit": False}
+    monkeypatch.setattr(
+        "comfy_cli.command.generate.upload.upload_path",
+        lambda *a, **kw: upload_called.__setitem__("hit", True) or gen_app.upload.UploadResult("x", None, False),
+    )
+    monkeypatch.setattr(
+        gen_app.client.httpx,
+        "post",
+        lambda *a, **kw: httpx.Response(200, json={"data": [{"url": "https://x/a.png"}]}),
+    )
+    r = runner.invoke(
+        cli_app,
+        [
+            "generate",
+            "ideogram-edit",
+            "--prompt",
+            "x",
+            "--rendering_speed",
+            "TURBO",
+            "--image",
+            str(img),
+        ],
+    )
+    assert r.exit_code == 0
+    assert upload_called["hit"] is False
+
+
+# ─── video models (async polling, generic poller path) ─────────────────
+
+
+def test_video_kling_async_path(runner, api_key, monkeypatch):
+    """End-to-end async path through the generic kling poller."""
+    submit = httpx.Response(200, json={"data": {"task_id": "k-xyz"}})
+    finished = httpx.Response(
+        200,
+        json={
+            "data": {
+                "task_status": "succeed",
+                "task_result": {"videos": [{"url": "https://cdn.example/k.mp4"}]},
+            }
+        },
+    )
+    monkeypatch.setattr(gen_app.client.httpx, "post", lambda *a, **kw: submit)
+    monkeypatch.setattr("comfy_cli.command.generate.client.get", lambda *a, **kw: finished)
+    monkeypatch.setattr("comfy_cli.command.generate.poll._sleep", lambda *_: None)
+
+    r = runner.invoke(cli_app, ["generate", "kling", "--prompt", "a cat", "--duration", "5"])
+    assert r.exit_code == 0, r.stdout
+    assert "https://cdn.example/k.mp4" in r.stdout
+
+
+def test_video_luma_async_path(runner, api_key, monkeypatch):
+    submit = httpx.Response(200, json={"id": "luma-1", "state": "queued"})
+    done = httpx.Response(200, json={"id": "luma-1", "state": "completed", "assets": {"video": "https://cdn/l.mp4"}})
+    monkeypatch.setattr(gen_app.client.httpx, "post", lambda *a, **kw: submit)
+    monkeypatch.setattr("comfy_cli.command.generate.client.get", lambda *a, **kw: done)
+    monkeypatch.setattr("comfy_cli.command.generate.poll._sleep", lambda *_: None)
+
+    r = runner.invoke(
+        cli_app,
+        [
+            "generate",
+            "luma",
+            "--prompt",
+            "a cat",
+            "--aspect_ratio",
+            "16:9",
+            "--model",
+            "ray-2",
+            "--resolution",
+            "{}",
+            "--duration",
+            "{}",
+        ],
+    )
+    assert r.exit_code == 0, r.stdout
+    assert "https://cdn/l.mp4" in r.stdout
+
+
+def test_video_runway_failure_surfaces(runner, api_key, monkeypatch):
+    submit = httpx.Response(200, json={"id": "rw-1"})
+    fail = httpx.Response(200, json={"id": "rw-1", "status": "FAILED"})
+    monkeypatch.setattr(gen_app.client.httpx, "post", lambda *a, **kw: submit)
+    monkeypatch.setattr("comfy_cli.command.generate.client.get", lambda *a, **kw: fail)
+    monkeypatch.setattr("comfy_cli.command.generate.poll._sleep", lambda *_: None)
+
+    r = runner.invoke(
+        cli_app,
+        [
+            "generate",
+            "runway-i2v",
+            "--promptImage",
+            '"https://x/img.png"',
+            "--seed",
+            "1",
+            "--model",
+            "gen4_turbo",
+            "--duration",
+            "5",
+            "--ratio",
+            "1280:720",
+        ],
+    )
+    assert r.exit_code == 1
+    assert "FAILED" in r.stdout
+
+
+def test_video_async_submission_shows_resume_alias(runner, api_key, monkeypatch):
+    submit = httpx.Response(200, json={"data": {"task_id": "k-async-1"}})
+    monkeypatch.setattr(gen_app.client.httpx, "post", lambda *a, **kw: submit)
+    r = runner.invoke(cli_app, ["generate", "kling", "--prompt", "x", "--async"])
+    assert r.exit_code == 0, r.stdout
+    assert "k-async-1" in r.stdout
+    assert "comfy generate resume kling k-async-1" in r.stdout
+
+
+def test_video_resume_kling(runner, api_key, monkeypatch):
+    done = httpx.Response(
+        200,
+        json={
+            "data": {
+                "task_status": "succeed",
+                "task_result": {"videos": [{"url": "https://cdn/resumed.mp4"}]},
+            }
+        },
+    )
+    monkeypatch.setattr("comfy_cli.command.generate.client.get", lambda *a, **kw: done)
+    monkeypatch.setattr("comfy_cli.command.generate.poll._sleep", lambda *_: None)
+    r = runner.invoke(cli_app, ["generate", "resume", "kling", "k-async-1"])
+    assert r.exit_code == 0, r.stdout
+    assert "https://cdn/resumed.mp4" in r.stdout
+
+
+def test_list_video_filter(runner):
+    r = runner.invoke(cli_app, ["generate", "list", "--style", "text-to-video"])
+    assert r.exit_code == 0
+    assert "kling" in r.stdout
+    assert "luma" in r.stdout
+    assert "pika" in r.stdout
 
 
 # ─── helpers: _arg_value / _separate_meta_flags ──────────────────────────
