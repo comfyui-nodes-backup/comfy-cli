@@ -89,6 +89,138 @@ class TestTrackEvent:
         tracking_module.provider.track.assert_called_once()
 
 
+class TestSubmitFeedback:
+    def test_sends_even_when_passive_consent_disabled(self, tracking_module):
+        # Feedback is explicit/user-initiated: it ignores the passive-telemetry
+        # consent flag (only the hard env opt-out can block it).
+        tracking_module.config_manager.set(constants.CONFIG_KEY_ENABLE_TRACKING, "False")
+        assert tracking_module.submit_feedback("great tool") is True
+        event_name, distinct_id, properties = _last_track_call(tracking_module.provider)
+        assert event_name == "feedback_submitted"
+        assert properties["message"] == "great tool"
+        assert distinct_id, "feedback must attach a stable distinct_id"
+
+    def test_sends_when_consent_unset(self, tracking_module):
+        # Default state (no consent recorded) — still sends.
+        assert tracking_module.submit_feedback("the run command is great") is True
+        event_name, _, properties = _last_track_call(tracking_module.provider)
+        assert event_name == "feedback_submitted"
+        assert properties["message"] == "the run command is great"
+
+    def test_uses_ephemeral_id_without_consent(self, tracking_module):
+        # When no consent is recorded (get_bool returns None → falsy), feedback
+        # must still send (user-initiated), but must NOT persist a user_id to disk.
+        # Previously this test encoded the old always-persist bug — updated to the
+        # correct privacy contract.
+        assert tracking_module.user_id is None
+        assert tracking_module.config_manager.get(constants.CONFIG_KEY_USER_ID) is None
+        tracking_module.submit_feedback("hi")
+        _, distinct_id, _ = _last_track_call(tracking_module.provider)
+        assert distinct_id  # an id is attached
+        assert tracking_module.config_manager.get(constants.CONFIG_KEY_USER_ID) is None  # NOT persisted
+
+    def test_generates_and_persists_user_id_when_absent_with_consent(self, tracking_module):
+        # With explicit consent on, feedback should persist a stable user_id.
+        tracking_module.config_manager.set(constants.CONFIG_KEY_ENABLE_TRACKING, "True")
+        assert tracking_module.user_id is None
+        assert tracking_module.config_manager.get(constants.CONFIG_KEY_USER_ID) is None
+        tracking_module.submit_feedback("hi")
+        persisted = tracking_module.config_manager.get(constants.CONFIG_KEY_USER_ID)
+        assert persisted is not None
+        _, distinct_id, _ = _last_track_call(tracking_module.provider)
+        assert distinct_id == persisted
+
+    def test_sends_scores_and_drops_none(self, tracking_module):
+        assert tracking_module.submit_feedback("", scores={"general_satisfaction": "5", "usability_satisfaction": None})
+        _, _, properties = _last_track_call(tracking_module.provider)
+        assert properties["general_satisfaction"] == "5"
+        assert "usability_satisfaction" not in properties
+        assert "message" not in properties
+
+    def test_returns_false_when_nothing_to_send(self, tracking_module):
+        assert tracking_module.submit_feedback("") is False
+        tracking_module.provider.track.assert_not_called()
+
+    @pytest.mark.parametrize("env_var", ["DO_NOT_TRACK", "COMFY_NO_TELEMETRY"])
+    def test_env_opt_out_blocks_feedback(self, tracking_module, monkeypatch, env_var):
+        tracking_module.config_manager.set(constants.CONFIG_KEY_ENABLE_TRACKING, "True")
+        monkeypatch.setenv(env_var, "1")
+        assert tracking_module.submit_feedback("hi") is False
+        tracking_module.provider.track.assert_not_called()
+
+
+class TestSubmitAgentReview:
+    def test_sends_when_consent_enabled(self, tracking_module):
+        tracking_module.config_manager.set(constants.CONFIG_KEY_ENABLE_TRACKING, "True")
+        assert tracking_module.submit_agent_review("user shipped a video after one retry") is True
+        event_name, _, properties = _last_track_call(tracking_module.provider)
+        assert event_name == "agent_review_submitted"
+        assert properties["summary"] == "user shipped a video after one retry"
+
+    def test_blocked_when_consent_disabled(self, tracking_module):
+        # Unlike feedback, an agent review is suppressed when passive consent is off.
+        tracking_module.config_manager.set(constants.CONFIG_KEY_ENABLE_TRACKING, "False")
+        assert tracking_module.submit_agent_review("anything") is False
+        tracking_module.provider.track.assert_not_called()
+
+    def test_blocked_when_consent_unset(self, tracking_module):
+        assert tracking_module.submit_agent_review("anything") is False
+        tracking_module.provider.track.assert_not_called()
+
+    def test_sends_under_session_only_consent(self, tracking_module):
+        tracking_module._session_only_tracking = True
+        assert tracking_module.submit_agent_review("ran fine") is True
+        event_name, _, _ = _last_track_call(tracking_module.provider)
+        assert event_name == "agent_review_submitted"
+
+    def test_returns_false_when_nothing_to_send(self, tracking_module):
+        tracking_module.config_manager.set(constants.CONFIG_KEY_ENABLE_TRACKING, "True")
+        assert tracking_module.submit_agent_review("") is False
+        tracking_module.provider.track.assert_not_called()
+
+    @pytest.mark.parametrize("env_var", ["DO_NOT_TRACK", "COMFY_NO_TELEMETRY"])
+    def test_env_opt_out_blocks_review(self, tracking_module, monkeypatch, env_var):
+        tracking_module.config_manager.set(constants.CONFIG_KEY_ENABLE_TRACKING, "True")
+        monkeypatch.setenv(env_var, "1")
+        assert tracking_module.submit_agent_review("hi") is False
+        tracking_module.provider.track.assert_not_called()
+
+
+def test_feedback_does_not_persist_user_id_without_consent(monkeypatch):
+    from comfy_cli import constants, tracking
+
+    sent = {}
+    monkeypatch.setattr(tracking, "_telemetry_disabled_by_env", lambda: False)
+    monkeypatch.setattr(tracking, "_dispatch", lambda name, props, *, distinct_id: sent.update(id=distinct_id))
+    # Consent declined; no persisted user_id; in-memory user_id empty.
+    monkeypatch.setattr(tracking.config_manager, "get_bool", lambda k: False)
+    persisted = {}
+    monkeypatch.setattr(tracking.config_manager, "set", lambda k, v: persisted.update({k: v}))
+    monkeypatch.setattr(tracking.config_manager, "get", lambda k: None)
+    monkeypatch.setattr(tracking, "user_id", "", raising=False)
+
+    assert tracking.submit_feedback("hello") is True
+    assert sent.get("id")  # an id was attached (ephemeral is fine)
+    assert constants.CONFIG_KEY_USER_ID not in persisted  # but NOT persisted to disk
+
+
+def test_feedback_persists_user_id_with_consent(monkeypatch):
+    from comfy_cli import constants, tracking
+
+    sent = {}
+    monkeypatch.setattr(tracking, "_telemetry_disabled_by_env", lambda: False)
+    monkeypatch.setattr(tracking, "_dispatch", lambda name, props, *, distinct_id: sent.update(id=distinct_id))
+    monkeypatch.setattr(tracking.config_manager, "get_bool", lambda k: True)  # consent ON
+    persisted = {}
+    monkeypatch.setattr(tracking.config_manager, "set", lambda k, v: persisted.update({k: v}))
+    monkeypatch.setattr(tracking.config_manager, "get", lambda k: None)
+    monkeypatch.setattr(tracking, "user_id", "", raising=False)
+
+    assert tracking.submit_feedback("hello") is True
+    assert sent.get("id")
+    assert persisted.get(constants.CONFIG_KEY_USER_ID)  # consent on -> identity persisted
+
+
 class TestTrackCommandRedaction:
     """track_command must redact secret-bearing kwargs before they reach the tracking system."""
 
@@ -389,7 +521,7 @@ class TestInitTrackingRoundTrip:
 
 
 class TestPromptTrackingConsent:
-    def test_enables_session_only_when_stdin_not_tty(self, tracking_module):
+    def test_no_tracking_when_stdin_not_tty(self, tracking_module):
         with (
             patch.object(tracking_module.sys.stdin, "isatty", return_value=False),
             patch.object(tracking_module.sys.stdout, "isatty", return_value=True),
@@ -398,10 +530,10 @@ class TestPromptTrackingConsent:
             tracking_module.prompt_tracking_consent()
         mock_prompt.assert_not_called()
         assert tracking_module.config_manager.get_bool(constants.CONFIG_KEY_ENABLE_TRACKING) is None
-        assert tracking_module._session_only_tracking is True
+        assert tracking_module._session_only_tracking is False
         assert tracking_module.user_id is not None
 
-    def test_enables_session_only_when_stdout_not_tty(self, tracking_module):
+    def test_no_tracking_when_stdout_not_tty(self, tracking_module):
         with (
             patch.object(tracking_module.sys.stdin, "isatty", return_value=True),
             patch.object(tracking_module.sys.stdout, "isatty", return_value=False),
@@ -410,19 +542,16 @@ class TestPromptTrackingConsent:
             tracking_module.prompt_tracking_consent()
         mock_prompt.assert_not_called()
         assert tracking_module.config_manager.get_bool(constants.CONFIG_KEY_ENABLE_TRACKING) is None
-        assert tracking_module._session_only_tracking is True
+        assert tracking_module._session_only_tracking is False
 
-    def test_session_only_tracking_fires_track_event(self, tracking_module):
+    def test_non_tty_does_not_fire_track_event(self, tracking_module):
         with (
             patch.object(tracking_module.sys.stdin, "isatty", return_value=False),
             patch.object(tracking_module.sys.stdout, "isatty", return_value=False),
         ):
             tracking_module.prompt_tracking_consent()
         tracking_module.track_event("some_event", {"k": "v"})
-        tracking_module.provider.track.assert_called_once()
-        event_name, distinct_id, _ = _last_track_call(tracking_module.provider)
-        assert event_name == "some_event"
-        assert distinct_id is not None
+        tracking_module.provider.track.assert_not_called()
 
     def test_session_only_persists_user_id(self, tracking_module):
         with (
@@ -444,8 +573,8 @@ class TestPromptTrackingConsent:
             patch.object(tracking_module.config_manager, "set", side_effect=PermissionError("read-only fs")),
         ):
             tracking_module.prompt_tracking_consent()
-        # In-memory state is still correct so this process tracks normally.
-        assert tracking_module._session_only_tracking is True
+        # Non-TTY sessions do not auto-enable tracking.
+        assert tracking_module._session_only_tracking is False
         assert tracking_module.user_id is not None
 
     def test_session_only_reuses_existing_user_id(self, tracking_module):

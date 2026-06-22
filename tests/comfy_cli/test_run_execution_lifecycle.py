@@ -52,16 +52,16 @@ class TestRunHappyPath:
 
         with patch("comfy_cli.cmdline.run_inner.execute") as mock_execute:
             mock_execute.return_value = None
-            result = runner.invoke(app, ["run", "--workflow", "wf.json"])
+            result = runner.invoke(app, ["run", "--workflow", "wf.json", "--where", "local", "--where", "local"])
 
-        assert result.exit_code == 0, f"stderr={result.stderr!r} exc={result.exception!r}"
+        assert result.exit_code == 0, f"stdout={result.output!r} exc={result.exception!r}"
         assert _event_names(tracked_run) == ["execution_start", "execution_success"]
 
     def test_execution_start_uses_mixpanel_name_run_alias(self, runner, tracked_run):
         from comfy_cli.cmdline import app
 
         with patch("comfy_cli.cmdline.run_inner.execute"):
-            runner.invoke(app, ["run", "--workflow", "wf.json"])
+            runner.invoke(app, ["run", "--workflow", "wf.json", "--where", "local"])
 
         # Only execution_start carries the alias; success/error do not.
         start_kwargs = next(kw for name, _, kw in tracked_run if name == "execution_start")
@@ -75,7 +75,19 @@ class TestRunHappyPath:
         with patch("comfy_cli.cmdline.run_inner.execute"):
             runner.invoke(
                 app,
-                ["run", "--workflow", "wf.json", "--timeout", "60", "--host", "1.2.3.4", "--port", "9000"],
+                [
+                    "run",
+                    "--workflow",
+                    "wf.json",
+                    "--where",
+                    "local",
+                    "--timeout",
+                    "60",
+                    "--host",
+                    "1.2.3.4",
+                    "--port",
+                    "9000",
+                ],
             )
 
         for name, props in _events(tracked_run):
@@ -94,7 +106,7 @@ class TestRunHappyPath:
         # Avoid env var leakage masking the redaction check.
         monkeypatch.delenv("COMFY_API_KEY", raising=False)
         with patch("comfy_cli.cmdline.run_inner.execute"):
-            runner.invoke(app, ["run", "--workflow", "wf.json", "--api-key", "sk-supersecret"])
+            runner.invoke(app, ["run", "--workflow", "wf.json", "--where", "local", "--api-key", "sk-supersecret"])
 
         for name, props in _events(tracked_run):
             assert props.get("api_key") == "<redacted>", f"{name} leaked api_key={props.get('api_key')!r}"
@@ -107,7 +119,7 @@ class TestRunFailurePath:
 
         with patch("comfy_cli.cmdline.run_inner.execute") as mock_execute:
             mock_execute.side_effect = typer.Exit(code=1)
-            result = runner.invoke(app, ["run", "--workflow", "wf.json"])
+            result = runner.invoke(app, ["run", "--workflow", "wf.json", "--where", "local"])
 
         assert result.exit_code == 1
         names = _event_names(tracked_run)
@@ -124,7 +136,7 @@ class TestRunFailurePath:
 
         with patch("comfy_cli.cmdline.run_inner.execute") as mock_execute:
             mock_execute.side_effect = ValueError("oops")
-            result = runner.invoke(app, ["run", "--workflow", "wf.json"])
+            result = runner.invoke(app, ["run", "--workflow", "wf.json", "--where", "local"])
 
         # The exception propagates; CliRunner surfaces it as a nonzero exit.
         assert result.exit_code != 0
@@ -141,7 +153,7 @@ class TestRunFailurePath:
 
         with patch("comfy_cli.cmdline.run_inner.execute") as mock_execute:
             mock_execute.side_effect = typer.Exit(code=0)
-            result = runner.invoke(app, ["run", "--workflow", "wf.json"])
+            result = runner.invoke(app, ["run", "--workflow", "wf.json", "--where", "local"])
 
         assert result.exit_code == 0
         assert _event_names(tracked_run) == ["execution_start", "execution_success"]
