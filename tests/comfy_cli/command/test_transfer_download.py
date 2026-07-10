@@ -10,8 +10,10 @@ keys are omitted.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -89,13 +91,29 @@ def _write_state(target: Target, *, record=None, item_map=None) -> list[str]:
 
 
 class _FakeResp:
-    """Context-manager response yielding one chunk then EOF."""
+    """Context-manager stand-in for http.client.HTTPResponse. ``read(n)``
+    honours ``n`` and advances through the body like the real object, so the
+    streaming loop and its running byte total are faithfully exercised.
+    Declares a matching Content-Length by default; pass an int to lie, None to
+    omit. ``chunk_size`` caps each read below ``n`` to force multi-read
+    streaming (and to model a chunked body that over-delivers past a small
+    declared Content-Length, which a real clipped Content-Length body cannot)."""
 
-    def __init__(self, data: bytes = b"\x89PNG-fake"):
-        self._chunks = [data]
+    def __init__(self, data: bytes = b"\x89PNG-fake", *, content_length="auto", chunk_size=None):
+        self._buf = data
+        self._pos = 0
+        self._chunk_size = chunk_size
+        self.reads = 0
+        if content_length == "auto":
+            content_length = len(data)
+        self.headers = {} if content_length is None else {"Content-Length": str(content_length)}
 
     def read(self, n: int) -> bytes:
-        return self._chunks.pop(0) if self._chunks else b""
+        self.reads += 1
+        take = n if self._chunk_size is None else min(n, self._chunk_size)
+        chunk = self._buf[self._pos : self._pos + take]
+        self._pos += len(chunk)
+        return chunk
 
     def __enter__(self):
         return self
@@ -109,7 +127,7 @@ def _run_download(fake_target, tmp_path, capsys) -> tuple[list[str], dict]:
     set_renderer(Renderer(mode=OutputMode.NDJSON, command="download"))
     with (
         patch("comfy_cli.command.transfer.resolve_target", return_value=fake_target),
-        patch.object(transfer._DOWNLOAD_OPENER, "open", side_effect=lambda req: _FakeResp()),
+        patch.object(transfer._DOWNLOAD_OPENER, "open", side_effect=lambda req, timeout=None: _FakeResp()),
     ):
         paths = transfer.execute_download(PROMPT_ID, out_dir=str(tmp_path / "out"))
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
@@ -333,7 +351,7 @@ class TestMachineModeStdoutPurity:
     def _download(self, fake_target, tmp_path):
         with (
             patch("comfy_cli.command.transfer.resolve_target", return_value=fake_target),
-            patch.object(transfer._DOWNLOAD_OPENER, "open", side_effect=lambda req: _FakeResp()),
+            patch.object(transfer._DOWNLOAD_OPENER, "open", side_effect=lambda req, timeout=None: _FakeResp()),
         ):
             transfer.execute_download(PROMPT_ID, out_dir=str(tmp_path / "out"))
 
@@ -376,6 +394,249 @@ class TestMachineModeStdoutPurity:
                 json.loads(ln)
         assert "downloaded" not in captured.out
         assert "downloaded" not in captured.err
+
+
+class TestDownloadIntegrity:
+    """A transfer that dies mid-body or oversteps the size cap must fail with a
+    structured envelope and leave neither the final file nor a `.part` partial
+    behind; completed downloads land atomically."""
+
+    def _failing_download(self, fake_target, tmp_path, capsys, resp=None, raises=None) -> dict:
+        import typer
+
+        def _open(req, **kw):
+            if raises is not None:
+                raise raises
+            return resp
+
+        set_renderer(Renderer(mode=OutputMode.JSON, command="download"))
+        _write_state(fake_target)
+        with (
+            patch("comfy_cli.command.transfer.resolve_target", return_value=fake_target),
+            patch.object(transfer._DOWNLOAD_OPENER, "open", side_effect=_open),
+        ):
+            with pytest.raises(typer.Exit) as excinfo:
+                transfer.execute_download(PROMPT_ID, out_dir=str(tmp_path / "out"))
+        assert excinfo.value.exit_code == 1
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        envelope = json.loads(lines[-1])
+        assert envelope["ok"] is False
+        return envelope["error"]
+
+    def test_truncated_body_errors_and_leaves_nothing(self, fake_target, tmp_path, capsys):
+        err = self._failing_download(fake_target, tmp_path, capsys, _FakeResp(b"x" * 400, content_length=1000))
+        assert err["code"] == "download_failed"
+        # Every size failure reports the server-declared length under the same
+        # key so a machine consumer never has to guess which spelling is present.
+        assert err["details"]["declared_bytes"] == 1000
+        assert err["details"]["received_bytes"] == 400
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_declared_size_over_cap_refused_before_body_read(self, fake_target, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(transfer, "_MAX_DOWNLOAD_BYTES", 100)
+        resp = _FakeResp(b"x" * 40, content_length=500)
+        err = self._failing_download(fake_target, tmp_path, capsys, resp)
+        assert err["code"] == "download_failed"
+        assert err["details"]["declared_bytes"] == 500
+        assert resp.reads == 0
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_body_exceeding_declared_length_aborts(self, fake_target, tmp_path, capsys):
+        # Chunked over-delivery is the real trigger: a body streamed in small
+        # chunks past a declared Content-Length of 100 (a plain Content-Length
+        # body would be clipped and never over-deliver). The abort must fire
+        # mid-stream, not only after the loop ends.
+        resp = _FakeResp(b"x" * 400, content_length=100, chunk_size=32)
+        err = self._failing_download(fake_target, tmp_path, capsys, resp)
+        assert err["code"] == "download_failed"
+        assert err["details"]["declared_bytes"] == 100
+        assert err["details"]["received_bytes"] > 100
+        assert resp.reads > 1  # streamed across multiple reads before aborting
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_lengthless_body_over_cap_errors_with_envelope(self, fake_target, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(transfer, "_MAX_DOWNLOAD_BYTES", 100)
+        resp = _FakeResp(b"x" * 400, content_length=None, chunk_size=32)
+        err = self._failing_download(fake_target, tmp_path, capsys, resp)
+        assert err["code"] == "download_failed"
+        assert err["details"]["received_bytes"] > 100
+        assert resp.reads > 1  # cap tripped while accumulating, not on one read
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_multichunk_body_reassembled_correctly(self, fake_target, tmp_path, capsys):
+        # A large body delivered across many reads must land byte-exact, so the
+        # running total and the temp-file writes stay in step with the stream.
+        body = bytes(range(256)) * 40  # 10240 bytes
+        set_renderer(Renderer(mode=OutputMode.NDJSON, command="download"))
+        _write_state(fake_target)
+        with (
+            patch("comfy_cli.command.transfer.resolve_target", return_value=fake_target),
+            patch.object(
+                transfer._DOWNLOAD_OPENER,
+                "open",
+                side_effect=lambda req, timeout=None: _FakeResp(body, chunk_size=100),
+            ),
+        ):
+            paths = transfer.execute_download(PROMPT_ID, out_dir=str(tmp_path / "out"))
+        assert all(Path(p).read_bytes() == body for p in paths)
+
+    def test_lengthless_body_downloads_without_verification(self, fake_target, tmp_path, capsys):
+        set_renderer(Renderer(mode=OutputMode.NDJSON, command="download"))
+        _write_state(fake_target)
+        with (
+            patch("comfy_cli.command.transfer.resolve_target", return_value=fake_target),
+            patch.object(
+                transfer._DOWNLOAD_OPENER, "open", side_effect=lambda req, timeout=None: _FakeResp(content_length=None)
+            ),
+        ):
+            paths = transfer.execute_download(PROMPT_ID, out_dir=str(tmp_path / "out"))
+        assert len(paths) == 4
+        assert all(Path(p).read_bytes() == b"\x89PNG-fake" for p in paths)
+
+    def test_completed_download_leaves_no_part_file(self, fake_target, tmp_path, capsys):
+        _write_state(fake_target)
+        paths, _ = _run_download(fake_target, tmp_path, capsys)
+        assert paths
+        assert list((tmp_path / "out").glob("*.part")) == []
+
+    def test_preexisting_part_sibling_survives_success(self, fake_target, tmp_path, capsys):
+        out = tmp_path / "out"
+        out.mkdir(parents=True)
+        bystander = out / f"{SHORT_ID}_000.png.part"
+        bystander.write_bytes(b"user data, not ours")
+        _write_state(fake_target)
+        paths, _ = _run_download(fake_target, tmp_path, capsys)
+        assert len(paths) == 4
+        assert bystander.read_bytes() == b"user data, not ours"
+
+    def test_preexisting_part_sibling_survives_failure(self, fake_target, tmp_path, capsys):
+        out = tmp_path / "out"
+        out.mkdir(parents=True)
+        bystander = out / f"{SHORT_ID}_000.png.part"
+        bystander.write_bytes(b"user data, not ours")
+        err = self._failing_download(fake_target, tmp_path, capsys, _FakeResp(b"x" * 40, content_length=100))
+        assert err["code"] == "download_failed"
+        assert bystander.read_bytes() == b"user data, not ours"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_downloaded_file_keeps_umask_permissions(self, fake_target, tmp_path, capsys):
+        _write_state(fake_target)
+        paths, _ = _run_download(fake_target, tmp_path, capsys)
+        umask = os.umask(0)
+        os.umask(umask)
+        assert (Path(paths[0]).stat().st_mode & 0o777) == 0o666 & ~umask
+
+    def test_connection_failure_emits_envelope_not_traceback(self, fake_target, tmp_path, capsys):
+        import urllib.error
+
+        err = self._failing_download(
+            fake_target, tmp_path, capsys, raises=urllib.error.URLError("[Errno 111] Connection refused")
+        )
+        assert err["code"] == "download_failed"
+        assert "refused" in err["details"]["reason"]
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_midstream_reset_emits_envelope_and_cleans_temp(self, fake_target, tmp_path, capsys):
+        class _ResettingResp(_FakeResp):
+            def read(self, n: int) -> bytes:
+                chunk = super().read(n)
+                if not chunk:
+                    raise ConnectionResetError("Connection reset by peer")
+                return chunk
+
+        err = self._failing_download(fake_target, tmp_path, capsys, _ResettingResp(b"x" * 100, content_length=None))
+        assert err["code"] == "download_failed"
+        assert "reset" in err["details"]["reason"]
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_chunked_truncation_incompleteread_emits_envelope(self, fake_target, tmp_path, capsys):
+        # A truncated chunked body raises http.client.IncompleteRead — an
+        # HTTPException, NOT an OSError — which used to escape both except arms
+        # as a raw traceback and break the machine-mode envelope contract.
+        import http.client
+
+        class _IncompleteResp(_FakeResp):
+            def read(self, n: int) -> bytes:
+                chunk = super().read(n)
+                if not chunk:
+                    raise http.client.IncompleteRead(b"", 500)
+                return chunk
+
+        err = self._failing_download(fake_target, tmp_path, capsys, _IncompleteResp(b"y" * 100, content_length=None))
+        assert err["code"] == "download_failed"
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_rename_failure_emits_envelope_and_cleans_temp(self, fake_target, tmp_path, capsys):
+        with patch("pathlib.Path.replace", side_effect=OSError("Permission denied")):
+            err = self._failing_download(fake_target, tmp_path, capsys, _FakeResp())
+        assert err["code"] == "download_failed"
+        assert "Permission denied" in err["details"]["reason"]
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_download_passes_socket_timeout(self, fake_target, tmp_path, capsys):
+        set_renderer(Renderer(mode=OutputMode.NDJSON, command="download"))
+        _write_state(fake_target)
+        opener = MagicMock(side_effect=lambda req, timeout=None: _FakeResp())
+        with (
+            patch("comfy_cli.command.transfer.resolve_target", return_value=fake_target),
+            patch.object(transfer._DOWNLOAD_OPENER, "open", opener),
+        ):
+            transfer.execute_download(PROMPT_ID, out_dir=str(tmp_path / "out"))
+        assert opener.call_args.kwargs["timeout"] == transfer._DOWNLOAD_TIMEOUT_S
+
+
+class TestDeclaredContentLength:
+    """Content-Length parsing must never raise (a ValueError would silently
+    disable size verification): unparseable or ambiguous headers degrade to
+    None, a folded duplicate that agrees is accepted."""
+
+    class _Resp:
+        def __init__(self, value):
+            self.headers = {} if value is None else {"Content-Length": value}
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("1000", 1000),
+            ("0", 0),
+            (None, None),
+            ("1000, 1000", 1000),  # folded duplicate that agrees
+            ("1000, 2000", None),  # folded duplicate that disagrees → ambiguous
+            ("not-a-number", None),
+            ("-5", None),
+            ("", None),
+        ],
+    )
+    def test_parses_or_degrades_to_none(self, value, expected):
+        assert transfer._declared_content_length(self._Resp(value)) == expected
+
+
+class TestPartFileHelper:
+    """`_open_part_file` owns the raw fd end-to-end: any failure closes it and
+    removes the temp file, and a copy whose source vanishes must not leak the
+    descriptor either (the fd is wrapped before the source is opened)."""
+
+    def _open_fd_count(self):
+        return len(os.listdir("/proc/self/fd"))
+
+    @pytest.mark.skipif(not hasattr(os, "fchmod"), reason="os.fchmod is POSIX-only")
+    def test_fchmod_failure_closes_fd_and_removes_temp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(os, "fchmod", lambda *a: (_ for _ in ()).throw(OSError("ENOTSUP")))
+        with pytest.raises(OSError, match="ENOTSUP"):
+            transfer._open_part_file(tmp_path / "out.png")
+        assert list(tmp_path.glob("*.part")) == []
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/self/fd fd accounting")
+    def test_missing_source_copy_leaks_no_fd_and_no_temp(self, tmp_path):
+        dst = tmp_path / "dst.bin"
+        missing = tmp_path / "gone.bin"
+        before = self._open_fd_count()
+        for _ in range(5):
+            with pytest.raises(FileNotFoundError):
+                transfer._copy_local_output_capped(missing, dst)
+        assert self._open_fd_count() == before
+        assert list(tmp_path.glob("*.part")) == []
+        assert not dst.exists()
 
 
 class TestLocalOutputCopy:
@@ -449,6 +710,37 @@ class TestLocalOutputCopy:
 
         assert Path(paths[0]).suffix == ".mp4"
         assert Path(paths[0]).read_bytes() == b"fake-mp4"
+
+    def test_copy_cap_enforced_during_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transfer, "_MAX_DOWNLOAD_BYTES", 100)
+        src = tmp_path / "big.bin"
+        src.write_bytes(b"x" * 300)
+        dst = tmp_path / "out" / "big.bin"
+        dst.parent.mkdir()
+        with pytest.raises(ValueError, match="safety limit"):
+            transfer._copy_local_output_capped(src, dst)
+        assert list(dst.parent.iterdir()) == []
+
+    def test_copy_cap_breach_surfaces_as_envelope(self, fake_target, tmp_path, capsys, monkeypatch):
+        import typer
+
+        src = tmp_path / "output" / "grew.png"
+        src.parent.mkdir()
+        src.write_bytes(b"\x89PNG-local")
+        self._write_local_state([str(src)])
+
+        def _cap_breach(src_, dst_):
+            raise ValueError("local output exceeds 100 byte safety limit")
+
+        monkeypatch.setattr(transfer, "_copy_local_output_capped", _cap_breach)
+        set_renderer(Renderer(mode=OutputMode.JSON, command="download"))
+        with patch("comfy_cli.command.transfer.resolve_target", return_value=fake_target):
+            with pytest.raises(typer.Exit) as excinfo:
+                transfer.execute_download(PROMPT_ID, out_dir=str(tmp_path / "out"))
+        assert excinfo.value.exit_code == 1
+        envelope = json.loads([ln for ln in capsys.readouterr().out.splitlines() if ln.strip()][-1])
+        assert envelope["error"]["code"] == "download_failed"
+        assert "safety limit" in envelope["error"]["message"]
 
     def test_missing_local_source_errors_cleanly(self, fake_target, tmp_path, capsys):
         self._write_local_state([str(tmp_path / "output" / "gone.png")])

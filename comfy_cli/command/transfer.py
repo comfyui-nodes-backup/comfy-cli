@@ -9,11 +9,13 @@ and output URLs from stdin, avoiding manual extraction.
 
 from __future__ import annotations
 
+import http.client
 import json
 import mimetypes
+import os
 import re
-import shutil
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -106,6 +108,24 @@ class _DownloadRedirectHandler(urllib.request.HTTPRedirectHandler):
 _TRANSFER_OPENER = urllib.request.build_opener(NoRedirectHandler("redirect refused (auth leak prevention)"))
 _DOWNLOAD_OPENER = urllib.request.build_opener(_DownloadRedirectHandler())
 
+# Per-output safety cap, shared by the HTTP download stream and local-output copies.
+_MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB
+
+# Per-socket-op (connect / each read) timeout for output downloads: a stalled
+# transfer aborts instead of hanging forever, while a steadily-flowing body of
+# any size is unaffected.
+_DOWNLOAD_TIMEOUT_S = 30
+
+# Stream/copy chunk size. 1 MiB keeps syscall volume low on multi-GB outputs
+# while still bounding memory and letting the size cap trip promptly.
+_DOWNLOAD_CHUNK = 1024 * 1024
+
+# The process umask, captured once at import. os has no getter, so reading it
+# means the classic set-and-restore dance; doing it here (single-threaded under
+# the import lock) avoids a per-download window where the process umask is 0.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+
 
 def _sanitize_multipart_filename(name: str) -> str:
     """Escape a filename for use in Content-Disposition per RFC 7578.
@@ -121,6 +141,83 @@ def _assert_download_url(url: str) -> None:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"refusing to download from non-HTTP URL: {url}")
+
+
+def _declared_content_length(resp: Any) -> int | None:
+    """Parse the response's Content-Length header; None when absent or invalid.
+
+    A misconfigured proxy can fold duplicate headers into a single
+    ``"123, 123"`` value; accept it only when every part agrees (so the
+    verified length is unambiguous), otherwise treat the header as absent
+    rather than letting ``int()`` raise and silently skip verification.
+    """
+    raw = resp.headers.get("Content-Length")
+    if raw is None:
+        return None
+    parts = {p.strip() for p in str(raw).split(",")}
+    if len(parts) != 1:
+        return None
+    try:
+        value = int(parts.pop())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _open_part_file(dst: Path) -> tuple[Any, Path]:
+    """Exclusively create a random ``<name>.<rand>.part`` sibling of ``dst``,
+    returning it open for binary writing plus its path.
+
+    mkstemp's O_EXCL + random name defeat a symlink planted in the out-dir
+    (a plain ``open("wb")`` would follow it) and keep concurrent downloads
+    off each other's temp files; its restrictive 0600 mode is widened to the
+    process umask so the renamed result keeps ``open("wb")``-equivalent
+    permissions. Returning an already-open file keeps the raw descriptor from
+    ever crossing back to a caller, and any failure here closes the fd and
+    removes the temp file so it can't leak a descriptor or orphan a ``.part``.
+    """
+    fd, name = tempfile.mkstemp(dir=str(dst.parent), prefix=dst.name + ".", suffix=".part")
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o666 & ~_UMASK)
+        return os.fdopen(fd, "wb"), Path(name)
+    except OSError:
+        os.close(fd)
+        Path(name).unlink(missing_ok=True)
+        raise
+
+
+def _copy_local_output_capped(src: Path, dst: Path) -> None:
+    """Copy ``src`` to ``dst`` via an exclusive sibling temp file.
+
+    The caller's pre-copy ``stat()`` cap check can be defeated by a source
+    that grows mid-copy or a pseudo-file that under-reports ``st_size`` —
+    enforce ``_MAX_DOWNLOAD_BYTES`` on the bytes actually read, and rename
+    into place so ``dst`` never holds a partial copy.
+    """
+    part_file, part_path = _open_part_file(dst)
+    try:
+        total = 0
+        # part_file is entered first so that if open(src) raises (a source
+        # unlinked between the caller's stat() and here), its already-entered
+        # context still closes the temp fd — the descriptor never leaks.
+        with part_file as df, open(src, "rb") as sf:
+            while True:
+                chunk = sf.read(_DOWNLOAD_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_DOWNLOAD_BYTES:
+                    raise ValueError(f"local output exceeds {_MAX_DOWNLOAD_BYTES} byte safety limit")
+                df.write(chunk)
+        part_path.replace(dst)
+        part_path = None
+    finally:
+        if part_path is not None:
+            try:
+                part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _local_source_path(url: str) -> Path | None:
@@ -551,11 +648,10 @@ def execute_download(
                     details={"url": url, "path": str(local_source), "index": idx},
                 )
                 raise typer.Exit(code=1)
-            # Mirror the HTTP branch's 10 GB safety cap so a pathological source
+            # Mirror the HTTP branch's safety cap so a pathological source
             # (e.g. an unbounded pseudo-file that still reports as regular) can't
             # exhaust the disk. stat() follows the symlinked source, matching
             # what copyfile actually reads.
-            max_download = 10 * 1024 * 1024 * 1024  # 10 GB safety cap
             try:
                 source_size = local_source.stat().st_size
             except OSError as e:
@@ -566,26 +662,21 @@ def execute_download(
                     details={"url": url, "path": str(local_source), "index": idx},
                 )
                 raise typer.Exit(code=1)
-            if source_size > max_download:
+            if source_size > _MAX_DOWNLOAD_BYTES:
                 renderer.error(
                     code="download_failed",
-                    message=f"Local output {idx} exceeds {max_download} byte safety limit",
+                    message=f"Local output {idx} exceeds {_MAX_DOWNLOAD_BYTES} byte safety limit",
                     hint="the source file is too large to copy",
                     details={"url": url, "path": str(local_source), "size": source_size, "index": idx},
                 )
                 raise typer.Exit(code=1)
             # Wrap the copy like the HTTP branch's failure handling: an OSError
-            # (permission denied, full/read-only dest) or SameFileError (source
-            # already equals the collision-safe dest) must surface as a
-            # structured envelope, not an unhandled traceback that breaks
-            # machine-mode/NDJSON consumers.
+            # (permission denied, full/read-only dest) or the mid-copy size cap
+            # must surface as a structured envelope, not an unhandled traceback
+            # that breaks machine-mode/NDJSON consumers.
             try:
-                shutil.copyfile(local_source, local_path)
-            except shutil.SameFileError:
-                # Source and dest are the same file — nothing to copy; the file
-                # is already at the destination path.
-                pass
-            except OSError as e:
+                _copy_local_output_capped(local_source, local_path)
+            except (OSError, ValueError) as e:
                 renderer.error(
                     code="download_failed",
                     message=f"Failed to copy local output {idx}: {e}",
@@ -609,19 +700,74 @@ def execute_download(
             for hdr, val in auth_hdrs.items():
                 req.add_header(hdr, val)
 
-            max_download = 10 * 1024 * 1024 * 1024  # 10 GB safety cap
+            # Stream into an exclusively-created temp file and rename it into
+            # place only once the body is complete and verified, so
+            # `local_path` never holds a partial file no matter how the
+            # transfer dies.
+            part_path: Path | None = None
             try:
-                with _DOWNLOAD_OPENER.open(req) as resp:
+                with _DOWNLOAD_OPENER.open(req, timeout=_DOWNLOAD_TIMEOUT_S) as resp:
+                    expected = _declared_content_length(resp)
+                    if expected is not None and expected > _MAX_DOWNLOAD_BYTES:
+                        renderer.error(
+                            code="download_failed",
+                            message=f"Output {idx} declares {expected} bytes, over the {_MAX_DOWNLOAD_BYTES} byte safety limit",
+                            hint="the output is too large to download",
+                            details={"url": url, "index": idx, "declared_bytes": expected},
+                        )
+                        raise typer.Exit(code=1)
+                    part_file, part_path = _open_part_file(local_path)
                     total = 0
-                    with open(local_path, "wb") as fp:
+                    with part_file as fp:
                         while True:
-                            chunk = resp.read(65536)
+                            chunk = resp.read(_DOWNLOAD_CHUNK)
                             if not chunk:
                                 break
                             total += len(chunk)
-                            if total > max_download:
-                                raise ValueError(f"download exceeds {max_download} byte safety limit")
+                            if expected is not None and total > expected:
+                                # http.client clips plain Content-Length bodies,
+                                # but ignores Content-Length when the response
+                                # is chunked — that pairing could stream far
+                                # past the declared size before the post-loop
+                                # check fires.
+                                renderer.error(
+                                    code="download_failed",
+                                    message=(
+                                        f"Download of output {idx} exceeds its declared "
+                                        f"Content-Length of {expected} bytes"
+                                    ),
+                                    hint="the server sent more data than it declared",
+                                    details={
+                                        "url": url,
+                                        "index": idx,
+                                        "declared_bytes": expected,
+                                        "received_bytes": total,
+                                    },
+                                )
+                                raise typer.Exit(code=1)
+                            if total > _MAX_DOWNLOAD_BYTES:
+                                renderer.error(
+                                    code="download_failed",
+                                    message=f"Download of output {idx} exceeds {_MAX_DOWNLOAD_BYTES} byte safety limit",
+                                    hint="the output is too large to download",
+                                    details={"url": url, "index": idx, "received_bytes": total},
+                                )
+                                raise typer.Exit(code=1)
                             fp.write(chunk)
+                # http.client returns EOF instead of raising IncompleteRead when
+                # a Content-Length body is cut short and read in chunks, so a
+                # dropped connection otherwise looks like a completed download —
+                # verify the byte count explicitly.
+                if expected is not None and total != expected:
+                    renderer.error(
+                        code="download_failed",
+                        message=f"Download of output {idx} truncated: received {total} of {expected} bytes",
+                        hint="the connection dropped mid-transfer; retry the download",
+                        details={"url": url, "index": idx, "declared_bytes": expected, "received_bytes": total},
+                    )
+                    raise typer.Exit(code=1)
+                part_path.replace(local_path)
+                part_path = None
             except urllib.error.HTTPError as e:
                 renderer.error(
                     code="download_failed",
@@ -630,6 +776,35 @@ def execute_download(
                     details={"status": e.code, "url": url, "index": idx},
                 )
                 raise typer.Exit(code=1)
+            except (OSError, http.client.HTTPException) as e:
+                # Everything that isn't an HTTP status lands here: URLError
+                # (refused/DNS/TLS — a subclass of OSError), a socket timeout
+                # or reset mid-read, filesystem errors from the temp-file
+                # create/write/rename, and a truncated *chunked* body — which
+                # raises http.client.IncompleteRead (an HTTPException, not an
+                # OSError) rather than the silent EOF a Content-Length body
+                # gives. Emit the envelope instead of a traceback so
+                # machine-mode consumers keep their contract.
+                reason = getattr(e, "reason", None) or e
+                # A bare TimeoutError()/IncompleteRead can stringify to "",
+                # which would emit a reason-less envelope — fall back to the
+                # exception's type name so the cause is always diagnosable.
+                reason_text = str(reason) or type(e).__name__
+                renderer.error(
+                    code="download_failed",
+                    message=f"Failed to download output {idx}: {reason_text}",
+                    hint="check that the server is reachable and the out-dir is writable",
+                    details={"url": url, "index": idx, "reason": reason_text},
+                )
+                raise typer.Exit(code=1)
+            finally:
+                # Cleared after the success rename; on every failure path this
+                # removes the partial download.
+                if part_path is not None:
+                    try:
+                        part_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
         file_size = local_path.stat().st_size
         entry: dict[str, Any] = {
