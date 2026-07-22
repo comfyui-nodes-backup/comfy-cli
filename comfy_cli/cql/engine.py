@@ -430,6 +430,21 @@ class Graph:
         self._consumers: dict[str, list[Morphism]] = defaultdict(list)
         self._types: set[str] = set()
         self._annotated = False
+        # The raw ``/object_info`` payload this graph was built from. Retained
+        # verbatim so callers that also need to lower a UI-format workflow to
+        # API format (``convert_ui_to_api``) can reuse it without a second fetch.
+        self._raw: dict[str, Any] = {}
+
+    @property
+    def object_info(self) -> dict[str, Any]:
+        """The raw ``/object_info`` dict this graph was built from (``{}`` if
+        the graph was constructed without one).
+
+        Read-only: this is the graph's live internal schema state, returned by
+        reference to avoid copying a large payload. Callers (e.g. the validate
+        command handing it to ``convert_ui_to_api``) must not mutate it.
+        """
+        return self._raw
 
     @classmethod
     def from_object_info(cls, object_info: dict[str, Any]) -> Graph:
@@ -439,6 +454,7 @@ class Graph:
                 details={"top_level_type": type(object_info).__name__},
             )
         g = cls()
+        g._raw = object_info
         for node_id, raw in object_info.items():
             if not isinstance(raw, dict):
                 continue
